@@ -219,9 +219,13 @@ class MONET:
             "polynomial_mutation". If several operators are given, one is
             selected uniformly at random for each offspring.
         social_learning: the crossover operators used for social learning, a
-            tuple with elements among "sbx" and "iso_dd". If several
+            tuple with elements among "sbx", "iso_dd" and "copy". If several
             operators are given, one is selected uniformly at random for
-            each offspring.
+            each offspring. "copy" adopts the neighbour's elite verbatim
+            (no blending) — the hard end of the specialist<->generalist
+            dial: accepted copies make a single controller cover several
+            tasks, and because the duplicates are exact, the number of
+            distinct controllers is a direct measure of generality.
         init_strategy: how the offspring of a focal task without elite is
             initialized: "copy" copies the elite of the selected neighbor
             (when social learning is applied and the neighbor has an elite),
@@ -240,7 +244,7 @@ class MONET:
     """
 
     individual_learning_operators = ("gaussian_mutation", "polynomial_mutation")
-    social_learning_operators = ("sbx", "iso_dd")
+    social_learning_operators = ("sbx", "iso_dd", "copy")
     neighbor_strategies = (
         "best_fitness",
         "random",
@@ -534,6 +538,13 @@ class MONET:
                         x, y, subkey, self._sbx_eta, self._minval, self._maxval
                     )
                 )
+            elif operator == "copy":
+                # Verbatim conformity: adopt the neighbour's elite unchanged.
+                # The hard end of the specialist<->generalist dial — the
+                # offspring IS the neighbour's controller, so accepted copies
+                # make one controller cover several tasks (duplicates are
+                # exact, which is what makes #distinct-controllers meaningful).
+                offsprings.append(jax.tree.map(lambda leaf: leaf, y))
             else:  # iso_dd
                 offsprings.append(
                     _iso_dd_crossover(
