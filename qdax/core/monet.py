@@ -199,7 +199,18 @@ class MONET:
     conformity_mode="majority") or the focal elite pulled towards the
     proximity-weighted neighbourhood mean (medoid pressure,
     conformity_mode="medoid"); conformity_mode="frequency" is the legacy
-    frequency-dependent variant. See ``_conformity_candidate``.
+    frequency-dependent variant. See ``_conformity_candidate``. The Gaussian
+    fallback is gated PER ROW by the operator actually applied: a row that
+    drew conformity falls back when its whole neighbourhood is empty, a row
+    that drew sbx / copy / iso_dd when the single selected neighbour has no
+    elite -- so conformity is spec-exact both as the sole social operator and
+    inside a mixed tuple such as ("sbx", "conformity"). The init path
+    (init_strategy="copy") copies the strategy-selected neighbour's elite,
+    as in the reference, never the conformity representative -- with ONE
+    legacy exception: conformity_mode="frequency" as the SOLE social operator
+    seeds an empty focal cell from the frequency-adopted variant, exactly as
+    the pre-2026-09-23 code did, so the conf_a{alpha}_m{m} archives stay
+    bit-reproducible.
 
     Note: the "regression" and "plane_dd" operators and the random /
     distance-proportional neighborhood modes of the reference implementation
@@ -274,10 +285,21 @@ class MONET:
                             conformity_m neighbours are drawn uniformly
                             with replacement and variant j is adopted
                             verbatim with probability
-                            c_j**alpha / sum_k c_k**alpha.
-            Whatever the mode, conformity IGNORES ``neighbor_strategy``:
-            that strategy selects the ONE neighbour handed to sbx / copy /
-            iso_dd, while conformity reads the whole neighbourhood.
+                            c_j**alpha / sum_k c_k**alpha. As the sole
+                            social operator it also keeps the legacy
+                            init source (an empty focal cell under
+                            init_strategy="copy" is seeded from the
+                            adopted variant), so old runs are
+                            bit-reproducible.
+            Whatever the mode, the conformity operator itself ignores
+            ``neighbor_strategy``: that strategy selects the ONE neighbour
+            handed to sbx / copy / iso_dd, while conformity reads the whole
+            neighbourhood. The strategy is NOT inert for the run, though:
+            with init_strategy="copy" (the default) an empty focal cell is
+            still filled from the strategy-picked neighbour's elite, so
+            "conformity + best_fitness" and "conformity + random" differ
+            until the archive is full. Use init_strategy="random" or a
+            pre-filled archive when the strategy must be inert.
         conformity_lambda: pull strength of the "medoid" mode, in (0, 1];
             1 sets the candidate to the weighted mean itself. Unused by the
             other modes.
@@ -572,9 +594,11 @@ class MONET:
     ) -> Tuple[jax.Array, jax.Array]:
         """LEGACY conformity_mode="frequency": frequency-dependent
         (conformist) transmission after Boyd & Richerson. Kept verbatim so
-        the existing conf_a{alpha}_m{m} results stay reproducible; it is NOT
-        the paper's conformity any more (see ``_conformity_candidate`` for
-        the "majority" and "medoid" modes).
+        the existing conf_a{alpha}_m{m} results stay reproducible (bit for
+        bit: as the sole social operator, ask() also seeds empty focal cells
+        under init_strategy="copy" from the adopted variant, as the old code
+        did); it is NOT the paper's conformity any more (see
+        ``_conformity_candidate`` for the "majority" and "medoid" modes).
 
         For each focal task, ``conformity_m`` neighbours are sampled UNIFORMLY
         WITH REPLACEMENT from the task's neighbourhood (restricted to
@@ -599,10 +623,14 @@ class MONET:
         neighbourhood, so the m samples are always drawn uniformly over the
         occupied neighbours; ``neighbor_strategy`` still governs the single
         neighbour handed to the other social operators. Consequence for
-        experiments: "conformity + best_fitness" is NOT a distinct condition -
-        it is identical to "conformity + random", so it cannot serve as a
-        control that separates the operator from the neighbour rule. Use
-        sbx/copy with ``neighbor_strategy`` in {random, best_fitness} for that.
+        experiments: the operator does not separate "conformity +
+        best_fitness" from "conformity + random", so that pair cannot serve
+        as a control that isolates the neighbour rule; use sbx/copy with
+        ``neighbor_strategy`` in {random, best_fitness} for that. The two
+        runs are nevertheless NOT bit-identical while the archive has empty
+        cells: with init_strategy="copy" (the default) an empty focal cell
+        is filled from the strategy-picked neighbour's elite. They coincide
+        with init_strategy="random" or a pre-filled archive.
 
         Memory: the variant counting compares m x m genotype pairs per focal
         task, i.e. O(batch_size * m^2 * genotype_size) during the ask step.
@@ -691,8 +719,11 @@ class MONET:
 
         NOTE: conformity does NOT use ``neighbor_strategy``. That strategy
         selects the ONE neighbour handed to sbx / copy / iso_dd; conformity
-        consumes the whole neighbourhood, so "conformity + best_fitness" and
-        "conformity + random" are the same condition.
+        consumes the whole neighbourhood. The strategy is not inert for the
+        run, though: with init_strategy="copy" (the default) an empty focal
+        cell is still filled from the strategy-picked neighbour's elite, so
+        "conformity + best_fitness" and "conformity + random" only coincide
+        with init_strategy="random" or a pre-filled archive.
 
         Memory ("majority"): the variant counting compares K x K genotype
         pairs per focal task, i.e. O(batch_size * K^2 * genotype_size); when
@@ -711,10 +742,16 @@ class MONET:
         Returns:
             the candidate genotype (pytree like ``x``), the neighbourhood
             representative it was built from (the majority variant, the
-            weighted mean target, or the legacy adopted variant; used to
-            initialise an empty focal cell under init_strategy="copy") and a
-            boolean mask, of shape (batch_size,), that is True where the
-            focal task had at least one neighbour holding an elite.
+            UNCLIPPED weighted mean target, or the legacy adopted variant;
+            exposed for tests / diagnostics only -- ask() never uses it, in
+            particular an empty focal cell under init_strategy="copy" is
+            initialised from the strategy-selected neighbour's elite as in
+            the reference; the one exception is the legacy "frequency" mode
+            as the sole social operator, whose init source is the adopted
+            variant as in the old code) and a boolean mask, of shape
+            (batch_size,), that
+            is True where the focal task had at least one neighbour holding
+            an elite.
         """
         batch_size, num_neighbors = neighbor_candidates.shape
         mode = self._conformity_mode
@@ -801,18 +838,33 @@ class MONET:
             )
         return candidate, target, any_occupied
 
+    def _operator_indices(
+        self, operators: Tuple[str, ...], key: RNGKey, batch_size: int
+    ) -> Optional[jax.Array]:
+        """The per-row operator choice of ``_apply_operators``: None for a
+        single operator (nothing is drawn, no key is consumed), otherwise a
+        uniform draw in [0, len(operators)) of shape (batch_size,) -- the
+        same draw ``_apply_operators`` makes from the same key."""
+        if len(operators) == 1:
+            return None
+        return jax.random.randint(key, (batch_size,), 0, len(operators))
+
     def _apply_operators(
         self,
         operators: Tuple[str, ...],
         offsprings: Tuple[Genotype, ...],
         key: RNGKey,
         batch_size: int,
+        operator_indices: Optional[jax.Array] = None,
     ) -> Genotype:
         """Select, for each offspring, the result of one of the operators,
-        uniformly at random."""
+        uniformly at random. ``operator_indices`` (see
+        ``_operator_indices``) may be passed to reuse an already drawn
+        per-row choice; when omitted it is drawn here from ``key``."""
         if len(operators) == 1:
             return offsprings[0]
-        operator_indices = jax.random.randint(key, (batch_size,), 0, len(operators))
+        if operator_indices is None:
+            operator_indices = self._operator_indices(operators, key, batch_size)
         result = offsprings[0]
         for i in range(1, len(operators)):
             result = _tree_where(operator_indices == i, offsprings[i], result)
@@ -849,11 +901,17 @@ class MONET:
         key: RNGKey,
         batch_size: int,
         y_conformity: Optional[Genotype] = None,
-    ) -> Genotype:
+    ) -> Tuple[Genotype, jax.Array]:
         """Apply social learning (crossover with a neighbor elite) to the
         focal elites. ``y_conformity`` is the candidate produced by the
         conformity operator (see ``_conformity_candidate``); it is only read
-        when "conformity" is among the social learning operators."""
+        when "conformity" is among the social learning operators.
+
+        Returns the social offspring and a boolean mask of shape
+        (batch_size,) that is True where the operator applied to that row is
+        "conformity" (all False when conformity is not configured); ask()
+        uses it to gate the Gaussian fallback per row on the occupancy the
+        applied operator actually depends on."""
         offsprings = []
         for operator in self._social_learning_ops:
             key, subkey = jax.random.split(key)
@@ -890,9 +948,25 @@ class MONET:
                     )
                 )
         key, subkey = jax.random.split(key)
-        return self._apply_operators(
-            self._social_learning_ops, tuple(offsprings), subkey, batch_size
+        operator_indices = self._operator_indices(
+            self._social_learning_ops, subkey, batch_size
         )
+        offspring = self._apply_operators(
+            self._social_learning_ops,
+            tuple(offsprings),
+            subkey,
+            batch_size,
+            operator_indices=operator_indices,
+        )
+        if "conformity" not in self._social_learning_ops:
+            is_conformity = jnp.zeros((batch_size,), dtype=bool)
+        elif operator_indices is None:
+            is_conformity = jnp.ones((batch_size,), dtype=bool)
+        else:
+            is_conformity = operator_indices == self._social_learning_ops.index(
+                "conformity"
+            )
+        return offspring, is_conformity
 
     def ask(
         self,
@@ -938,25 +1012,24 @@ class MONET:
 
         # conformity reads the whole neighbourhood (not the single neighbour
         # selected above) and builds its own candidate, so it carries its
-        # own occupancy mask; when it is the only social operator that mask
-        # and its neighbourhood representative also drive the fallback and
-        # the init_strategy="copy" path below
+        # own occupancy mask (True iff some neighbour holds an elite). That
+        # mask gates the Gaussian fallback ONLY on the rows whose applied
+        # operator is conformity (see _social_learning); y and
+        # neighbor_occupied -- the strategy-selected neighbour -- are left
+        # untouched so the init_strategy="copy" path below copies that
+        # neighbour's elite exactly as the reference does.
         if "conformity" in self._social_learning_ops:
             key, subkey = jax.random.split(key)
-            y_conformity, conformity_rep, conformity_occupied = (
-                self._conformity_candidate(
-                    repertoire,
-                    x,
-                    task_indices,
-                    monet_state.neighbor_indices[task_indices],
-                    subkey,
-                )
+            y_conformity, _, conformity_occupied = self._conformity_candidate(
+                repertoire,
+                x,
+                task_indices,
+                monet_state.neighbor_indices[task_indices],
+                subkey,
             )
-            if self._social_learning_ops == ("conformity",):
-                neighbor_occupied = conformity_occupied
-                y = conformity_rep
         else:
             y_conformity = y
+            conformity_occupied = neighbor_occupied
 
         # individual learning: mutation of the focal elite
         key, subkey = jax.random.split(key)
@@ -964,13 +1037,15 @@ class MONET:
 
         # social learning: crossover with the neighbor elite, with a
         # fallback to a Gaussian mutation when the neighbor has no elite
+        # (conformity rows: when the whole neighbourhood has no elite)
         key, subkey = jax.random.split(key)
-        social_offspring = self._social_learning(
+        social_offspring, is_conformity = self._social_learning(
             x, y, subkey, batch_size, y_conformity=y_conformity
         )
+        social_occupied = jnp.where(is_conformity, conformity_occupied, neighbor_occupied)
         key, subkey = jax.random.split(key)
         social_offspring = _tree_where(
-            neighbor_occupied,
+            social_occupied,
             social_offspring,
             _gaussian_mutation(
                 x, subkey, self._mutation_std, self._minval, self._maxval
@@ -981,12 +1056,24 @@ class MONET:
 
         # focal tasks without elite: copy the neighbor elite (when social
         # learning is applied and the neighbor has one) or sample a random
-        # solution
+        # solution. LEGACY: the pre-2026-09-23 code seeded empty focal cells
+        # from the frequency-adopted variant when "conformity" was the sole
+        # social operator; that case keeps its old init source so the
+        # conf_a{alpha}_m{m} archives stay bit-reproducible. Every other
+        # configuration (spec modes, mixed tuples, sbx / copy / iso_dd)
+        # copies the strategy-selected neighbour, as the reference does.
+        if (
+            self._conformity_mode == "frequency"
+            and self._social_learning_ops == ("conformity",)
+        ):
+            y_init, init_occupied = y_conformity, conformity_occupied
+        else:
+            y_init, init_occupied = y, neighbor_occupied
         key, subkey = jax.random.split(key)
         random_genotypes = _tree_uniform(x, subkey, self._minval, self._maxval)
         if self._init_strategy == "copy":
             init_genotypes = _tree_where(
-                (~individual) & neighbor_occupied, y, random_genotypes
+                (~individual) & init_occupied, y_init, random_genotypes
             )
         else:
             init_genotypes = random_genotypes
