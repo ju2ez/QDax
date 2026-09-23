@@ -262,6 +262,14 @@ class MONET:
         polynomial_eta: eta parameter of the polynomial mutation.
         iso_sigma: iso parameter of the Iso+Line variation.
         line_sigma: line parameter of the Iso+Line variation.
+        neighborhood: connectivity of the task graph, "closest" (each task is
+            linked to its num_neighbors nearest tasks in descriptor space, the
+            default and the behaviour of every archive built before 2026-09-23) or
+            "random" (each task is linked to num_neighbors tasks drawn uniformly
+            without replacement). Degree and step count are the same under both, so
+            the pair isolates the contribution of task similarity. Note that this is
+            a different axis from neighbor_strategy, which picks one neighbour out of
+            the linked ones.
         top_k_similar: number of candidate neighbors considered by the
             "most_similar" and "least_similar" strategies.
         conformity_mode: what the "conformity" operator does with the
@@ -341,6 +349,7 @@ class MONET:
         polynomial_eta: float = 5.0,
         iso_sigma: float = 1.0 / 300.0,
         line_sigma: float = 20.0 / 300.0,
+        neighborhood: str = "closest",
         top_k_similar: int = 3,
         conformity_m: int = 3,
         conformity_alpha: float = 1.0,
@@ -405,6 +414,11 @@ class MONET:
         self._polynomial_eta = polynomial_eta
         self._iso_sigma = iso_sigma
         self._line_sigma = line_sigma
+        if neighborhood not in ("closest", "random"):
+            raise ValueError(
+                f"neighborhood must be 'closest' or 'random', got {neighborhood!r}."
+            )
+        self._neighborhood = neighborhood
         self._top_k_similar = top_k_similar
         self._conformity_m = int(conformity_m)
         self._conformity_alpha = float(conformity_alpha)
@@ -517,13 +531,26 @@ class MONET:
         # gene untouched (delta <= 1e-15 fails the `valid` test at _sbx_crossover), so the
         # offspring is the focal elite re-evaluated and accepted on >=, which changes nothing.
         num_neighbors = max(1, min(self._num_neighbors, num_tasks - 1))
-        distances = jnp.sum(
-            jnp.square(task_descriptors[:, None, :] - task_descriptors[None, :, :]),
-            axis=-1,
-        )
+        # CONNECTIVITY (added 2026-09-23). `neighborhood` decides WHICH tasks are linked,
+        # `neighbor_strategy` decides which of the linked tasks a social step reads. With
+        # "closest" the graph is the k nearest tasks in descriptor space, as before. With
+        # "random" every task is linked to k tasks drawn uniformly without replacement,
+        # which keeps the graph's degree and the number of social steps identical and
+        # removes only the task similarity: it is the control for the question of whether
+        # the task geometry matters at all.
+        # The "closest" branch does not consume `key`, so archives built before this change
+        # are reproduced bit for bit.
+        if self._neighborhood == "random":
+            key, graph_key = jax.random.split(key)
+            scores = jax.random.uniform(graph_key, (num_tasks, num_tasks))
+        else:
+            scores = jnp.sum(
+                jnp.square(task_descriptors[:, None, :] - task_descriptors[None, :, :]),
+                axis=-1,
+            )
         # exclude self-loops
-        distances = distances + jnp.diag(jnp.full(num_tasks, jnp.inf))
-        _, neighbor_indices = jax.lax.top_k(-distances, num_neighbors)
+        scores = scores + jnp.diag(jnp.full(num_tasks, jnp.inf))
+        _, neighbor_indices = jax.lax.top_k(-scores, num_neighbors)
         monet_state = MONETState(neighbor_indices=neighbor_indices)
 
         # calculate the initial metrics
