@@ -244,7 +244,7 @@ class MONET:
     """
 
     individual_learning_operators = ("gaussian_mutation", "polynomial_mutation")
-    social_learning_operators = ("sbx", "iso_dd", "copy")
+    social_learning_operators = ("sbx", "iso_dd", "copy", "conformity")
     neighbor_strategies = (
         "best_fitness",
         "random",
@@ -272,6 +272,8 @@ class MONET:
         iso_sigma: float = 1.0 / 300.0,
         line_sigma: float = 20.0 / 300.0,
         top_k_similar: int = 3,
+        conformity_m: int = 3,
+        conformity_alpha: float = 1.0,
         minval: float = 0.0,
         maxval: float = 1.0,
         repertoire_init: Callable[
@@ -301,6 +303,12 @@ class MONET:
                 f"Unknown init strategy: {init_strategy}. "
                 'Supported strategies: ("copy", "random").'
             )
+        if conformity_m < 1:
+            raise ValueError(f"conformity_m must be >= 1, got {conformity_m}.")
+        if conformity_alpha < 0.0:
+            raise ValueError(
+                f"conformity_alpha must be >= 0, got {conformity_alpha}."
+            )
 
         self._scoring_function = scoring_function
         self._metrics_function = metrics_function
@@ -317,6 +325,8 @@ class MONET:
         self._iso_sigma = iso_sigma
         self._line_sigma = line_sigma
         self._top_k_similar = top_k_similar
+        self._conformity_m = int(conformity_m)
+        self._conformity_alpha = float(conformity_alpha)
         self._minval = minval
         self._maxval = maxval
         self._repertoire_init = repertoire_init
@@ -413,7 +423,17 @@ class MONET:
         # is 1 / (1 + distance), so the most similar neighbors are the
         # nearest neighbors in task descriptor space
         num_tasks = task_descriptors.shape[0]
-        num_neighbors = min(self._num_neighbors, num_tasks - 1)
+        # SINGLE-TASK GUARD (added 2026-09-22). With num_tasks == 1 this expression gave 0,
+        # so neighbor_candidates had shape (batch, 0) and _select_neighbors crashed in
+        # jnp.argmax with "attempt to get argmax of an empty sequence". A one-task MONET is
+        # degenerate but legitimate -- it is the k=1 point of a controller-count curve -- and it
+        # should reduce to individual learning, not raise.
+        # Clamping to 1 makes the sole candidate the task itself (the inf diagonal below means
+        # top_k has nothing else to return). That is inert rather than wrong: the social operator
+        # then crosses the focal elite with itself, and SBX on identical parents leaves every
+        # gene untouched (delta <= 1e-15 fails the `valid` test at _sbx_crossover), so the
+        # offspring is the focal elite re-evaluated and accepted on >=, which changes nothing.
+        num_neighbors = max(1, min(self._num_neighbors, num_tasks - 1))
         distances = jnp.sum(
             jnp.square(task_descriptors[:, None, :] - task_descriptors[None, :, :]),
             axis=-1,
@@ -483,6 +503,88 @@ class MONET:
 
         return neighbor_candidates[jnp.arange(batch_size), columns]
 
+    def _conformity_neighbors(
+        self,
+        repertoire: MONETRepertoire,
+        neighbor_candidates: jax.Array,
+        key: RNGKey,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Frequency-dependent (conformist) transmission, Boyd & Richerson.
+
+        For each focal task, ``conformity_m`` neighbours are sampled UNIFORMLY
+        WITH REPLACEMENT from the task's neighbourhood (restricted to
+        neighbours that hold an elite), their elite genotypes are grouped into
+        variants by exact equality, and variant j is adopted verbatim with
+
+            P(j) = c_j ** alpha / sum_k c_k ** alpha,
+
+        where c_j is the number of the m samples carrying variant j.
+
+        Implementation: sample i is drawn with weight c(i) ** (alpha - 1),
+        where c(i) counts the samples equal to sample i. Since variant j
+        contributes c_j such samples, the induced variant law is exactly
+        c_j ** alpha / sum_k c_k ** alpha.
+
+        Reductions: alpha = 1 gives unbiased copying of one uniformly sampled
+        neighbour; m = 1 gives copying of one uniformly sampled neighbour for
+        any alpha; alpha = 0 gives a uniform draw over the distinct variants.
+
+        NOTE: this operator does NOT use ``neighbor_strategy``. Frequency-
+        dependent transmission is defined over a uniform sample of the
+        neighbourhood, so the m samples are always drawn uniformly over the
+        occupied neighbours; ``neighbor_strategy`` still governs the single
+        neighbour handed to the other social operators. Consequence for
+        experiments: "conformity + best_fitness" is NOT a distinct condition -
+        it is identical to "conformity + random", so it cannot serve as a
+        control that separates the operator from the neighbour rule. Use
+        sbx/copy with ``neighbor_strategy`` in {random, best_fitness} for that.
+
+        Memory: the variant counting compares m x m genotype pairs per focal
+        task, i.e. O(batch_size * m^2 * genotype_size) during the ask step.
+
+        Args:
+            repertoire: the MONET repertoire
+            neighbor_candidates: neighbors of each focal task, of shape
+                (batch_size, num_neighbors)
+            key: a jax PRNG random key
+
+        Returns:
+            the indices of the adopted neighbor tasks, of shape (batch_size,),
+            and a boolean mask, of shape (batch_size,), that is True where the
+            focal task had at least one neighbor holding an elite.
+        """
+        batch_size, num_neighbors = neighbor_candidates.shape
+        m = self._conformity_m
+        occupied = repertoire.fitnesses[neighbor_candidates, 0] > -jnp.inf
+        any_occupied = jnp.any(occupied, axis=1)
+
+        # uniform over the occupied neighbours; if a focal task has none, fall
+        # back to a uniform draw over all of them (the caller then replaces the
+        # offspring exactly as it does for an unoccupied single neighbour)
+        logits = jnp.where(occupied, 0.0, -jnp.inf)
+        logits = jnp.where(any_occupied[:, None], logits, jnp.zeros_like(logits))
+        key, subkey = jax.random.split(key)
+        columns = jax.random.categorical(subkey, logits, axis=-1, shape=(m, batch_size))
+        columns = jnp.transpose(columns)                       # (batch_size, m)
+        sampled = jnp.take_along_axis(neighbor_candidates, columns, axis=1)
+
+        # count, for every sample, how many of the m samples carry the same
+        # genotype (exact equality over every leaf of the pytree)
+        equal = jnp.ones((batch_size, m, m), dtype=bool)
+        for leaf in jax.tree.leaves(repertoire.genotypes):
+            values = leaf[sampled]                             # (batch_size, m, ...)
+            values = values.reshape(batch_size, m, -1)
+            equal = equal & jnp.all(
+                values[:, :, None, :] == values[:, None, :, :], axis=-1
+            )
+        counts = jnp.sum(equal, axis=2).astype(jnp.float32)     # (batch_size, m)
+
+        key, subkey = jax.random.split(key)
+        log_weights = (self._conformity_alpha - 1.0) * jnp.log(counts)
+        picked = jax.random.categorical(subkey, log_weights, axis=-1)
+        adopted = sampled[jnp.arange(batch_size), picked]
+        return adopted, any_occupied
+
     def _apply_operators(
         self,
         operators: Tuple[str, ...],
@@ -525,10 +627,17 @@ class MONET:
         )
 
     def _social_learning(
-        self, x: Genotype, y: Genotype, key: RNGKey, batch_size: int
+        self,
+        x: Genotype,
+        y: Genotype,
+        key: RNGKey,
+        batch_size: int,
+        y_conformity: Optional[Genotype] = None,
     ) -> Genotype:
         """Apply social learning (crossover with a neighbor elite) to the
-        focal elites."""
+        focal elites. ``y_conformity`` is the elite adopted by the conformity
+        operator (see ``_conformity_neighbors``); it is only read when
+        "conformity" is among the social learning operators."""
         offsprings = []
         for operator in self._social_learning_ops:
             key, subkey = jax.random.split(key)
@@ -538,6 +647,12 @@ class MONET:
                         x, y, subkey, self._sbx_eta, self._minval, self._maxval
                     )
                 )
+            elif operator == "conformity":
+                # Frequency-dependent transmission: the offspring IS the
+                # adopted variant, so accepted offspring make one controller
+                # cover several tasks, as with "copy" — but the variant is
+                # chosen with a tunable bias towards the local majority.
+                offsprings.append(jax.tree.map(lambda leaf: leaf, y_conformity))
             elif operator == "copy":
                 # Verbatim conformity: adopt the neighbour's elite unchanged.
                 # The hard end of the specialist<->generalist dial — the
@@ -604,6 +719,22 @@ class MONET:
         y = jax.tree.map(lambda g: g[neighbor_indices], repertoire.genotypes)
         neighbor_occupied = repertoire.fitnesses[neighbor_indices, 0] > -jnp.inf
 
+        # conformity draws its own neighbour (a frequency-biased variant over
+        # conformity_m samples), so it carries its own occupancy mask
+        if "conformity" in self._social_learning_ops:
+            key, subkey = jax.random.split(key)
+            conformity_indices, conformity_occupied = self._conformity_neighbors(
+                repertoire, monet_state.neighbor_indices[task_indices], subkey
+            )
+            y_conformity = jax.tree.map(
+                lambda g: g[conformity_indices], repertoire.genotypes
+            )
+            if self._social_learning_ops == ("conformity",):
+                neighbor_occupied = conformity_occupied
+                y = y_conformity
+        else:
+            y_conformity = y
+
         # individual learning: mutation of the focal elite
         key, subkey = jax.random.split(key)
         individual_offspring = self._individual_learning(x, subkey, batch_size)
@@ -611,7 +742,9 @@ class MONET:
         # social learning: crossover with the neighbor elite, with a
         # fallback to a Gaussian mutation when the neighbor has no elite
         key, subkey = jax.random.split(key)
-        social_offspring = self._social_learning(x, y, subkey, batch_size)
+        social_offspring = self._social_learning(
+            x, y, subkey, batch_size, y_conformity=y_conformity
+        )
         key, subkey = jax.random.split(key)
         social_offspring = _tree_where(
             neighbor_occupied,

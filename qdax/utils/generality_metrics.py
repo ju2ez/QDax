@@ -35,10 +35,12 @@ def _flatten_genotypes(genotypes) -> jnp.ndarray:
 
 def count_distinct_exact(genotypes, valid_mask: Optional[jnp.ndarray] = None) -> int:
     """Number of bit-identical controllers. Correct for the "copy" operator."""
+    import numpy as np
+
     flat = _flatten_genotypes(genotypes)
     if valid_mask is not None:
         flat = flat[valid_mask]
-    return int(jnp.unique(flat, axis=0).shape[0])
+    return int(np.unique(np.asarray(flat), axis=0).shape[0])
 
 
 def count_distinct_eps(
@@ -46,23 +48,27 @@ def count_distinct_eps(
 ) -> int:
     """Number of controllers that differ by more than `eps` in parameter space.
 
-    Greedy single-pass clustering: a genotype joins the first representative
-    within `eps` (normalised euclidean distance), else starts a new one. Use
-    for blending operators, where exact duplicates never occur. `eps` is
-    scale-dependent — prefer the behavioural variant when fitness is available.
+    Implemented as a grid snap: coordinates are quantised to a lattice of side
+    `eps` and identical cells are counted once (O(n log n) via np.unique on the
+    host). This replaces an earlier greedy O(n^2) version that also forced a
+    host-device sync per genotype — at 5000 tasks with mostly-distinct elites
+    (i.e. any blending operator) that took >10 min per run, with the GPU idle.
+
+    Grid snapping is an approximation: two points either side of a cell border
+    are counted separately even if closer than `eps`. It is a lower-bound-ish
+    proxy for merge count and is scale-dependent, so prefer the behavioural
+    variant when fitness is available.
     """
+    import numpy as np
+
     flat = _flatten_genotypes(genotypes)
     if valid_mask is not None:
         flat = flat[valid_mask]
-    reps: list[jnp.ndarray] = []
-    for g in flat:
-        if not reps:
-            reps.append(g)
-            continue
-        d = jnp.linalg.norm(jnp.stack(reps) - g, axis=1) / jnp.sqrt(g.shape[0])
-        if float(d.min()) > eps:
-            reps.append(g)
-    return len(reps)
+    arr = np.asarray(flat)
+    if eps <= 0:
+        return int(np.unique(arr, axis=0).shape[0])
+    cells = np.round(arr / eps).astype(np.int64)
+    return int(np.unique(cells, axis=0).shape[0])
 
 
 def count_distinct_behavioural(
