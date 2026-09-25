@@ -315,6 +315,24 @@ class MONET:
             "frequency" mode (>= 1). Unused by the other modes.
         conformity_alpha: exponent of the legacy "frequency" mode (>= 0).
             Unused by the other modes.
+        conformity_pressure: probability, in [0, 1], that a SOCIAL step
+            enforces conformity instead of learning from the neighbour picked
+            by ``neighbor_strategy`` (Julian, 2026-09-25: conformity is
+            separate from social learning). On such a row the offspring is
+            the neighbourhood's majority genotype (exact-equality mode over
+            the occupied num_neighbors nearest tasks, ties uniform, as in
+            conformity_mode="majority") and it is ENFORCED: it replaces the
+            focal elite whatever its fitness, and its fresh score is stored.
+            Enforcement therefore also re-scores an incumbent that already
+            equals the majority. Other rows of the batch aimed at an enforced
+            cell are dropped. The overall enforcement rate is
+            (1 - p_ind) * conformity_pressure, lower where the neighbourhood
+            is empty (no enforcement there). 0 (the default) leaves every
+            code path and every random draw of the previous behaviour
+            unchanged. Independent of the "conformity" social operator, and
+            not combinable with it. Enforcement needs the mask that ask()
+            returns in its extra info ("conformity_enforced"): update() passes
+            it on, ask/tell users must hand it to tell(enforced=...).
         minval: minimum value of the solution space.
         maxval: maximum value of the solution space.
         repertoire_init: a function to initialize the repertoire.
@@ -355,6 +373,7 @@ class MONET:
         conformity_alpha: float = 1.0,
         conformity_mode: str = "majority",
         conformity_lambda: float = 0.5,
+        conformity_pressure: float = 0.0,
         minval: float = 0.0,
         maxval: float = 1.0,
         repertoire_init: Callable[
@@ -400,6 +419,16 @@ class MONET:
                 f"conformity_lambda must be in (0, 1], got {conformity_lambda}."
             )
 
+        if not (0.0 <= float(conformity_pressure) <= 1.0):
+            raise ValueError(
+                f"conformity_pressure must be in [0, 1], got {conformity_pressure}."
+            )
+        if float(conformity_pressure) > 0.0 and "conformity" in social_learning:
+            raise ValueError(
+                "conformity_pressure > 0 replaces the 'conformity' social operator; "
+                "use one or the other."
+            )
+
         self._scoring_function = scoring_function
         self._metrics_function = metrics_function
         self._batch_size = batch_size
@@ -424,6 +453,7 @@ class MONET:
         self._conformity_alpha = float(conformity_alpha)
         self._conformity_mode = str(conformity_mode)
         self._conformity_lambda = float(conformity_lambda)
+        self._conformity_pressure = float(conformity_pressure)
         self._minval = minval
         self._maxval = maxval
         self._repertoire_init = repertoire_init
@@ -705,6 +735,60 @@ class MONET:
         adopted = sampled[jnp.arange(batch_size), picked]
         return adopted, any_occupied
 
+    def _majority_variant(
+        self,
+        repertoire: MONETRepertoire,
+        neighbor_candidates: jax.Array,
+        key: RNGKey,
+    ) -> Tuple[Genotype, jax.Array]:
+        """The most frequent elite genotype of each focal task's neighbourhood
+        (exact equality over every leaf, ties uniform, unoccupied neighbours
+        not counted), and a mask, of shape (batch_size,), True where at least
+        one neighbour holds an elite. Shared by conformity_mode="majority"
+        and conformity_pressure; see ``_conformity_candidate`` for the tie
+        rule and the memory bound."""
+        batch_size, num_neighbors = neighbor_candidates.shape
+        occupied = repertoire.fitnesses[neighbor_candidates, 0] > -jnp.inf
+        any_occupied = jnp.any(occupied, axis=1)
+        neighbor_genotypes = jax.tree.map(
+            lambda g: g[neighbor_candidates], repertoire.genotypes
+        )
+        # flatten every leaf to (batch_size, num_neighbors, features)
+        values = jnp.concatenate(
+            [
+                leaf.reshape(batch_size, num_neighbors, -1)
+                for leaf in jax.tree.leaves(neighbor_genotypes)
+            ],
+            axis=-1,
+        )
+        num_features = values.shape[-1]
+        if batch_size * num_neighbors * num_neighbors * num_features <= 2**26:
+            equal = jnp.all(values[:, :, None, :] == values[:, None, :, :], axis=-1)
+        else:
+
+            def _scan_feature(carry: jax.Array, v: jax.Array) -> Tuple[jax.Array, None]:
+                return carry & (v[:, :, None] == v[:, None, :]), None
+
+            equal, _ = jax.lax.scan(
+                _scan_feature,
+                jnp.ones((batch_size, num_neighbors, num_neighbors), dtype=bool),
+                jnp.moveaxis(values, -1, 0),
+            )
+        # count of each neighbour's variant over the OCCUPIED neighbours
+        counts = jnp.sum(equal & occupied[:, None, :], axis=2)
+        counts = jnp.where(occupied, counts, 0)
+        is_max = occupied & (counts == jnp.max(counts, axis=1, keepdims=True))
+        # uniform over the neighbours carrying a maximal-count variant ==
+        # uniform over the tied variants; an empty neighbourhood gets a
+        # uniform draw over all columns (replaced by the caller anyway)
+        logits = jnp.where(is_max, 0.0, -jnp.inf)
+        logits = jnp.where(any_occupied[:, None], logits, jnp.zeros_like(logits))
+        columns = jax.random.categorical(key, logits, axis=-1)
+        y = jax.tree.map(
+            lambda g: g[jnp.arange(batch_size), columns], neighbor_genotypes
+        )
+        return y, any_occupied
+
     def _conformity_candidate(
         self,
         repertoire: MONETRepertoire,
@@ -798,40 +882,7 @@ class MONET:
         )
 
         if mode == "majority":
-            # flatten every leaf to (batch_size, num_neighbors, features)
-            values = jnp.concatenate(
-                [
-                    leaf.reshape(batch_size, num_neighbors, -1)
-                    for leaf in jax.tree.leaves(neighbor_genotypes)
-                ],
-                axis=-1,
-            )
-            num_features = values.shape[-1]
-            if batch_size * num_neighbors * num_neighbors * num_features <= 2**26:
-                equal = jnp.all(values[:, :, None, :] == values[:, None, :, :], axis=-1)
-            else:
-
-                def _scan_feature(carry: jax.Array, v: jax.Array) -> Tuple[jax.Array, None]:
-                    return carry & (v[:, :, None] == v[:, None, :]), None
-
-                equal, _ = jax.lax.scan(
-                    _scan_feature,
-                    jnp.ones((batch_size, num_neighbors, num_neighbors), dtype=bool),
-                    jnp.moveaxis(values, -1, 0),
-                )
-            # count of each neighbour's variant over the OCCUPIED neighbours
-            counts = jnp.sum(equal & occupied[:, None, :], axis=2)
-            counts = jnp.where(occupied, counts, 0)
-            is_max = occupied & (counts == jnp.max(counts, axis=1, keepdims=True))
-            # uniform over the neighbours carrying a maximal-count variant ==
-            # uniform over the tied variants; an empty neighbourhood gets a
-            # uniform draw over all columns (replaced by the caller anyway)
-            logits = jnp.where(is_max, 0.0, -jnp.inf)
-            logits = jnp.where(any_occupied[:, None], logits, jnp.zeros_like(logits))
-            columns = jax.random.categorical(key, logits, axis=-1)
-            y = jax.tree.map(
-                lambda g: g[jnp.arange(batch_size), columns], neighbor_genotypes
-            )
+            y, _ = self._majority_variant(repertoire, neighbor_candidates, key)
             return y, y, any_occupied
 
         # mode == "medoid": proximity-weighted mean of the occupied neighbours
@@ -1106,7 +1157,25 @@ class MONET:
             init_genotypes = random_genotypes
         genotypes = _tree_where(focal_occupied, genotypes, init_genotypes)
 
-        return genotypes, task_indices, {}
+        if self._conformity_pressure <= 0.0:
+            return genotypes, task_indices, {}
+
+        # conformity pressure: with probability conformity_pressure a social
+        # row copies its neighbourhood's majority genotype instead, and that
+        # copy is enforced in tell(). Drawn after everything above, so the
+        # other rows' offspring are the ones pressure = 0 would produce.
+        key, subkey = jax.random.split(key)
+        y_majority, majority_occupied = self._majority_variant(
+            repertoire, monet_state.neighbor_indices[task_indices], subkey
+        )
+        key, subkey = jax.random.split(key)
+        enforced = (
+            (~individual)
+            & majority_occupied
+            & jax.random.bernoulli(subkey, self._conformity_pressure, (batch_size,))
+        )
+        genotypes = _tree_where(enforced, y_majority, genotypes)
+        return genotypes, task_indices, {"conformity_enforced": enforced}
 
     def tell(
         self,
@@ -1116,6 +1185,7 @@ class MONET:
         repertoire: MONETRepertoire,
         monet_state: MONETState,
         extra_scores: Optional[ExtraScores] = None,
+        enforced: Optional[jax.Array] = None,
     ) -> Tuple[MONETRepertoire, MONETState, Metrics]:
         """
         Add new genotypes to the repertoire.
@@ -1128,11 +1198,35 @@ class MONET:
             repertoire: the MONET repertoire
             monet_state: the MONET state
             extra_scores: extra scores of the new genotypes
+            enforced: optional boolean mask, of shape (batch_size,), from
+                ask()'s extra info ("conformity_enforced"). An enforced row
+                replaces its cell's elite whatever its fitness; the other rows
+                aimed at that cell are dropped; several enforced rows on one
+                cell keep the fittest. None (default) enforces nothing.
         """
         if extra_scores is None:
             extra_scores = {}
 
         fitnesses = jnp.ravel(fitnesses)
+        if enforced is not None:
+            enforced = jnp.ravel(enforced)
+            num_tasks = repertoire.centroids.shape[0]
+            cell_enforced = (
+                jax.ops.segment_max(
+                    enforced.astype(jnp.int32), task_indices, num_segments=num_tasks
+                )
+                > 0
+            )
+            fitnesses = jnp.where(
+                cell_enforced[task_indices] & ~enforced, -jnp.inf, fitnesses
+            )
+            # clear the incumbents of the enforced cells, so the >= rule of
+            # the repertoire admits the enforced copy whatever its score
+            repertoire = repertoire.replace(
+                fitnesses=jnp.where(
+                    cell_enforced[:, None], -jnp.inf, repertoire.fitnesses
+                )
+            )
         task_descriptors = repertoire.centroids[task_indices]
 
         # add genotypes to the repertoire: as the descriptor of an offspring
@@ -1177,7 +1271,7 @@ class MONET:
 
         # generate offsprings on their focal tasks
         key, subkey = jax.random.split(key)
-        genotypes, task_indices, _ = self.ask(repertoire, monet_state, subkey)
+        genotypes, task_indices, ask_info = self.ask(repertoire, monet_state, subkey)
 
         # score the offsprings on the focal tasks
         key, subkey = jax.random.split(key)
@@ -1192,6 +1286,7 @@ class MONET:
             repertoire=repertoire,
             monet_state=monet_state,
             extra_scores=extra_scores,
+            enforced=ask_info.get("conformity_enforced"),
         )
 
     def scan_update(
