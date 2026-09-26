@@ -341,6 +341,12 @@ class MONET:
     individual_learning_operators = ("gaussian_mutation", "polynomial_mutation")
     social_learning_operators = ("sbx", "iso_dd", "copy", "conformity")
     conformity_modes = ("majority", "medoid", "frequency")
+    # element count up to which the majority's pairwise genotype comparison is done in one
+    # broadcast; above it, one genotype component at a time (lax.scan). Both are exact, so the
+    # choice never changes a result. 2**20, not the earlier 2**26: at the arm sweep's size
+    # (batch 64, 250 neighbours, 10 genes = 4e7 elements) the broadcast took 24.6 MIN to compile
+    # on the GPU (XLA), the scan 5 s, and the scan also runs faster (0.31 ms an iteration).
+    _majority_direct_max = 2**20
     neighbor_strategies = (
         "best_fitness",
         "random",
@@ -762,7 +768,7 @@ class MONET:
             axis=-1,
         )
         num_features = values.shape[-1]
-        if batch_size * num_neighbors * num_neighbors * num_features <= 2**26:
+        if batch_size * num_neighbors * num_neighbors * num_features <= self._majority_direct_max:
             equal = jnp.all(values[:, :, None, :] == values[:, None, :, :], axis=-1)
         else:
 
@@ -838,7 +844,7 @@ class MONET:
 
         Memory ("majority"): the variant counting compares K x K genotype
         pairs per focal task, i.e. O(batch_size * K^2 * genotype_size); when
-        that exceeds ~2^26 elements the comparison is scanned one genotype
+        that exceeds _majority_direct_max (2^20) elements the comparison is scanned one genotype
         component at a time, which bounds it at O(batch_size * K^2).
 
         Args:
