@@ -32,6 +32,12 @@ class MONETState(flax.struct.PyTreeNode):
     """
 
     neighbor_indices: jax.Array
+    # Per-operator bookkeeping (2026-09-28), rows = individual / social / enforced conformity,
+    # columns = attempts on an occupied cell, accepted of those (the >= rule, so neutral and
+    # identical offspring count), strictly improved of those (f > old), fills of an empty cell,
+    # summed fitness change of the accepted ones (negative only for enforced copies). Diagnostic only: nothing reads it back, so results are
+    # unchanged. None (states built by hand) disables the bookkeeping.
+    op_stats: Optional[jax.Array] = None
 
 
 def _tree_where(mask: jax.Array, on_true: Genotype, on_false: Genotype) -> Genotype:
@@ -587,7 +593,8 @@ class MONET:
         # exclude self-loops
         scores = scores + jnp.diag(jnp.full(num_tasks, jnp.inf))
         _, neighbor_indices = jax.lax.top_k(-scores, num_neighbors)
-        monet_state = MONETState(neighbor_indices=neighbor_indices)
+        monet_state = MONETState(neighbor_indices=neighbor_indices,
+                                 op_stats=jnp.zeros((3, 5), dtype=jnp.float32))
 
         # calculate the initial metrics
         metrics = self._metrics_function(repertoire)
@@ -1163,8 +1170,9 @@ class MONET:
             init_genotypes = random_genotypes
         genotypes = _tree_where(focal_occupied, genotypes, init_genotypes)
 
+        op_info = {"op_individual": individual, "op_focal_occupied": focal_occupied}
         if self._conformity_pressure <= 0.0:
-            return genotypes, task_indices, {}
+            return genotypes, task_indices, op_info
 
         # conformity pressure: with probability conformity_pressure a social
         # row copies its neighbourhood's majority genotype instead, and that
@@ -1181,7 +1189,7 @@ class MONET:
             & jax.random.bernoulli(subkey, self._conformity_pressure, (batch_size,))
         )
         genotypes = _tree_where(enforced, y_majority, genotypes)
-        return genotypes, task_indices, {"conformity_enforced": enforced}
+        return genotypes, task_indices, dict(op_info, conformity_enforced=enforced)
 
     def tell(
         self,
@@ -1192,6 +1200,7 @@ class MONET:
         monet_state: MONETState,
         extra_scores: Optional[ExtraScores] = None,
         enforced: Optional[jax.Array] = None,
+        op_info: Optional[dict] = None,
     ) -> Tuple[MONETRepertoire, MONETState, Metrics]:
         """
         Add new genotypes to the repertoire.
@@ -1214,6 +1223,10 @@ class MONET:
             extra_scores = {}
 
         fitnesses = jnp.ravel(fitnesses)
+        stats_update = None
+        if op_info is not None and monet_state.op_stats is not None:
+            stats_update = self._op_stats_update(
+                fitnesses, task_indices, repertoire, op_info, enforced)
         if enforced is not None:
             enforced = jnp.ravel(enforced)
             num_tasks = repertoire.centroids.shape[0]
@@ -1243,8 +1256,38 @@ class MONET:
 
         # update the metrics
         metrics = self._metrics_function(repertoire)
+        if stats_update is not None:
+            monet_state = monet_state.replace(op_stats=monet_state.op_stats + stats_update)
 
         return repertoire, monet_state, metrics
+
+    def _op_stats_update(self, fitnesses, task_indices, repertoire, op_info, enforced):
+        """This batch's contribution to MONETState.op_stats (see there). A row counts as accepted
+        when it would be written by the repertoire's rule: it is the best row aimed at its cell
+        and not below the incumbent (>=), or it is an enforced copy. Rows aimed at an enforced
+        cell that are not enforced are dropped and count as rejected."""
+        num_tasks = repertoire.centroids.shape[0]
+        old = repertoire.fitnesses[task_indices, 0]
+        f = fitnesses
+        if enforced is not None:
+            enforced = jnp.ravel(enforced)
+            cell_enf = jax.ops.segment_max(enforced.astype(jnp.int32), task_indices,
+                                           num_segments=num_tasks) > 0
+            f = jnp.where(cell_enf[task_indices] & ~enforced, -jnp.inf, f)
+        else:
+            enforced = jnp.zeros_like(f, dtype=bool)
+        best = jax.ops.segment_max(f, task_indices, num_segments=num_tasks)[task_indices]
+        accepted = (f > -jnp.inf) & (f == best) & ((f >= old) | enforced)
+        fill = ~op_info["op_focal_occupied"]
+        cat = jnp.where(enforced, 2, jnp.where(op_info["op_individual"], 0, 1))
+        gain = jnp.where(accepted & ~fill, f - old, 0.0)
+        rows = []
+        for c in range(3):
+            m = cat == c
+            rows.append(jnp.stack([jnp.sum(m & ~fill), jnp.sum(m & ~fill & accepted),
+                                   jnp.sum(m & ~fill & accepted & (f > old)),
+                                   jnp.sum(m & fill), jnp.sum(jnp.where(m, gain, 0.0))]))
+        return jnp.stack(rows).astype(jnp.float32)
 
     def update(
         self,
@@ -1293,6 +1336,7 @@ class MONET:
             monet_state=monet_state,
             extra_scores=extra_scores,
             enforced=ask_info.get("conformity_enforced"),
+            op_info=ask_info,
         )
 
     def scan_update(
