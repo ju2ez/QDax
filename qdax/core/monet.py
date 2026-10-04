@@ -339,6 +339,13 @@ class MONET:
             not combinable with it. Enforcement needs the mask that ask()
             returns in its extra info ("conformity_enforced"): update() passes
             it on, ask/tell users must hand it to tell(enforced=...).
+            SCHEDULES (2026-10-04): ask() and update() take an optional
+            ``conformity_pressure`` override, a scalar (may be traced) that
+            replaces this value in the per-row Bernoulli draw for that call
+            only, so a driver can anneal the pressure with the evaluations
+            spent. It is honoured only when the constructor's value is > 0
+            (that is what builds the majority machinery); None keeps the
+            constant behaviour bit for bit.
         minval: minimum value of the solution space.
         maxval: maximum value of the solution space.
         repertoire_init: a function to initialize the repertoire.
@@ -1064,6 +1071,7 @@ class MONET:
         repertoire: MONETRepertoire,
         monet_state: MONETState,
         key: RNGKey,
+        conformity_pressure: Optional[jax.Array] = None,
     ) -> Tuple[Genotype, jax.Array, ExtraScores]:
         """
         Generate a new batch of genotypes: sample the focal tasks, apply
@@ -1075,6 +1083,8 @@ class MONET:
             repertoire: the MONET repertoire
             monet_state: the MONET state, holding the task similarity graph
             key: a jax PRNG random key
+            conformity_pressure: optional per-call override of the
+                constructor's conformity_pressure (see there; schedules).
 
         Returns:
             a new batch of genotypes, the indices of the tasks on which they
@@ -1186,7 +1196,11 @@ class MONET:
         enforced = (
             (~individual)
             & majority_occupied
-            & jax.random.bernoulli(subkey, self._conformity_pressure, (batch_size,))
+            & jax.random.bernoulli(
+                subkey,
+                self._conformity_pressure if conformity_pressure is None else conformity_pressure,
+                (batch_size,),
+            )
         )
         genotypes = _tree_where(enforced, y_majority, genotypes)
         return genotypes, task_indices, dict(op_info, conformity_enforced=enforced)
@@ -1294,6 +1308,7 @@ class MONET:
         repertoire: MONETRepertoire,
         monet_state: MONETState,
         key: RNGKey,
+        conformity_pressure: Optional[jax.Array] = None,
     ) -> Tuple[MONETRepertoire, MONETState, Metrics]:
         """
         Performs one iteration of the MONET algorithm.
@@ -1310,6 +1325,7 @@ class MONET:
             repertoire: the MONET repertoire
             monet_state: the MONET state, holding the task similarity graph
             key: a jax PRNG random key
+            conformity_pressure: optional per-call pressure, passed to ask().
 
         Returns:
             the updated MONET repertoire, the MONET state and metrics about
@@ -1320,7 +1336,9 @@ class MONET:
 
         # generate offsprings on their focal tasks
         key, subkey = jax.random.split(key)
-        genotypes, task_indices, ask_info = self.ask(repertoire, monet_state, subkey)
+        genotypes, task_indices, ask_info = self.ask(
+            repertoire, monet_state, subkey, conformity_pressure=conformity_pressure
+        )
 
         # score the offsprings on the focal tasks
         key, subkey = jax.random.split(key)
