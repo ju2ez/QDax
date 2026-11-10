@@ -32,11 +32,6 @@ class MONETState(flax.struct.PyTreeNode):
     """
 
     neighbor_indices: jax.Array
-    # Per-operator bookkeeping (2026-09-28), rows = individual / social / enforced conformity,
-    # columns = attempts on an occupied cell, accepted of those (the >= rule, so neutral and
-    # identical offspring count), strictly improved of those (f > old), fills of an empty cell,
-    # summed fitness change of the accepted ones (negative only for enforced copies). Diagnostic only: nothing reads it back, so results are
-    # unchanged. None (states built by hand) disables the bookkeeping.
     op_stats: Optional[jax.Array] = None
 
 
@@ -203,20 +198,15 @@ class MONET:
     elite with ONE neighbour: it reads the focal task's whole neighbourhood
     and proposes either the locally most common elite (copy conformity,
     conformity_mode="majority") or the focal elite pulled towards the
-    proximity-weighted neighbourhood mean (medoid pressure,
-    conformity_mode="medoid"); conformity_mode="frequency" is the legacy
-    frequency-dependent variant. See ``_conformity_candidate``. The Gaussian
+    proximity-weighted neighbourhood medoid (medoid pressure,
+    conformity_mode="medoid"). See ``_conformity_candidate``. The Gaussian
     fallback is gated PER ROW by the operator actually applied: a row that
     drew conformity falls back when its whole neighbourhood is empty, a row
     that drew sbx / copy / iso_dd when the single selected neighbour has no
     elite -- so conformity is spec-exact both as the sole social operator and
     inside a mixed tuple such as ("sbx", "conformity"). The init path
     (init_strategy="copy") copies the strategy-selected neighbour's elite,
-    as in the reference, never the conformity representative -- with ONE
-    legacy exception: conformity_mode="frequency" as the SOLE social operator
-    seeds an empty focal cell from the frequency-adopted variant, exactly as
-    the pre-2026-09-23 code did, so the conf_a{alpha}_m{m} archives stay
-    bit-reproducible.
+    as in the reference, never the conformity representative.
 
     Note: the "regression" and "plane_dd" operators and the random /
     distance-proportional neighborhood modes of the reference implementation
@@ -289,22 +279,11 @@ class MONET:
                             neighbour);
               "medoid"    — medoid pressure: the candidate is the focal
                             elite pulled linearly towards the
-                            proximity-weighted mean of the neighbours'
-                            elites (weights 1 / (d_i + 1e-8) over the
-                            task-descriptor distances, normalised),
-                            candidate = clip(x + lambda * (target - x));
-              "frequency" — LEGACY (the previous behaviour, kept so the
-                            conf_a{alpha}_m{m} results stay reproducible;
-                            NOT the paper's conformity any more):
-                            conformity_m neighbours are drawn uniformly
-                            with replacement and variant j is adopted
-                            verbatim with probability
-                            c_j**alpha / sum_k c_k**alpha. As the sole
-                            social operator it also keeps the legacy
-                            init source (an empty focal cell under
-                            init_strategy="copy" is seeded from the
-                            adopted variant), so old runs are
-                            bit-reproducible.
+                            proximity-weighted medoid of the neighbours'
+                            elites (i* = argmin_i sum_j w_j ||g_i - g_j||_2
+                            with weights w_j proportional to 1 / (d_j + 1e-8)
+                            over the task-descriptor distances),
+                            candidate = clip(x + lambda * (target - x)).
             Whatever the mode, the conformity operator itself ignores
             ``neighbor_strategy``: that strategy selects the ONE neighbour
             handed to sbx / copy / iso_dd, while conformity reads the whole
@@ -315,12 +294,8 @@ class MONET:
             until the archive is full. Use init_strategy="random" or a
             pre-filled archive when the strategy must be inert.
         conformity_lambda: pull strength of the "medoid" mode, in (0, 1];
-            1 sets the candidate to the weighted mean itself. Unused by the
+            1 sets the candidate to the medoid itself. Unused by the
             other modes.
-        conformity_m: number of neighbours sampled by the legacy
-            "frequency" mode (>= 1). Unused by the other modes.
-        conformity_alpha: exponent of the legacy "frequency" mode (>= 0).
-            Unused by the other modes.
         conformity_pressure: probability, in [0, 1], that a SOCIAL step
             enforces conformity instead of learning from the neighbour picked
             by ``neighbor_strategy`` (Julian, 2026-09-25: conformity is
@@ -353,12 +328,7 @@ class MONET:
 
     individual_learning_operators = ("gaussian_mutation", "polynomial_mutation")
     social_learning_operators = ("sbx", "iso_dd", "copy", "conformity")
-    conformity_modes = ("majority", "medoid", "frequency")
-    # element count up to which the majority's pairwise genotype comparison is done in one
-    # broadcast; above it, one genotype component at a time (lax.scan). Both are exact, so the
-    # choice never changes a result. 2**20, not the earlier 2**26: at the arm sweep's size
-    # (batch 64, 250 neighbours, 10 genes = 4e7 elements) the broadcast took 24.6 MIN to compile
-    # on the GPU (XLA), the scan 5 s, and the scan also runs faster (0.31 ms an iteration).
+    conformity_modes = ("majority", "medoid")
     _majority_direct_max = 2**20
     neighbor_strategies = (
         "best_fitness",
@@ -388,8 +358,6 @@ class MONET:
         line_sigma: float = 20.0 / 300.0,
         neighborhood: str = "closest",
         top_k_similar: int = 3,
-        conformity_m: int = 3,
-        conformity_alpha: float = 1.0,
         conformity_mode: str = "majority",
         conformity_lambda: float = 0.5,
         conformity_pressure: float = 0.0,
@@ -422,12 +390,6 @@ class MONET:
             raise ValueError(
                 f"Unknown init strategy: {init_strategy}. "
                 'Supported strategies: ("copy", "random").'
-            )
-        if conformity_m < 1:
-            raise ValueError(f"conformity_m must be >= 1, got {conformity_m}.")
-        if conformity_alpha < 0.0:
-            raise ValueError(
-                f"conformity_alpha must be >= 0, got {conformity_alpha}."
             )
         if conformity_mode not in self.conformity_modes:
             raise ValueError(
@@ -473,13 +435,9 @@ class MONET:
             )
         self._neighborhood = neighborhood
         self._top_k_similar = top_k_similar
-        self._conformity_m = int(conformity_m)
-        self._conformity_alpha = float(conformity_alpha)
         self._conformity_mode = str(conformity_mode)
         self._conformity_lambda = float(conformity_lambda)
         self._conformity_pressure = float(conformity_pressure)
-        # tempered pressure (2026-11-10): None = the enforced rule above (bit-identical to before);
-        # a float tau = Metropolis acceptance of the majority copy, see tell().
         self._pressure_temperature = (
             None if pressure_temperature is None else float(pressure_temperature)
         )
@@ -575,30 +533,8 @@ class MONET:
             extra_scores,
         )
 
-        # build the task similarity graph: the similarity between two tasks
-        # is 1 / (1 + distance), so the most similar neighbors are the
-        # nearest neighbors in task descriptor space
         num_tasks = task_descriptors.shape[0]
-        # SINGLE-TASK GUARD (added 2026-09-22). With num_tasks == 1 this expression gave 0,
-        # so neighbor_candidates had shape (batch, 0) and _select_neighbors crashed in
-        # jnp.argmax with "attempt to get argmax of an empty sequence". A one-task MONET is
-        # degenerate but legitimate -- it is the k=1 point of a controller-count curve -- and it
-        # should reduce to individual learning, not raise.
-        # Clamping to 1 makes the sole candidate the task itself (the inf diagonal below means
-        # top_k has nothing else to return). That is inert rather than wrong: the social operator
-        # then crosses the focal elite with itself, and SBX on identical parents leaves every
-        # gene untouched (delta <= 1e-15 fails the `valid` test at _sbx_crossover), so the
-        # offspring is the focal elite re-evaluated and accepted on >=, which changes nothing.
         num_neighbors = max(1, min(self._num_neighbors, num_tasks - 1))
-        # CONNECTIVITY (added 2026-09-23). `neighborhood` decides WHICH tasks are linked,
-        # `neighbor_strategy` decides which of the linked tasks a social step reads. With
-        # "closest" the graph is the k nearest tasks in descriptor space, as before. With
-        # "random" every task is linked to k tasks drawn uniformly without replacement,
-        # which keeps the graph's degree and the number of social steps identical and
-        # removes only the task similarity: it is the control for the question of whether
-        # the task geometry matters at all.
-        # The "closest" branch does not consume `key`, so archives built before this change
-        # are reproduced bit for bit.
         if self._neighborhood == "random":
             key, graph_key = jax.random.split(key)
             scores = jax.random.uniform(graph_key, (num_tasks, num_tasks))
@@ -673,98 +609,6 @@ class MONET:
 
         return neighbor_candidates[jnp.arange(batch_size), columns]
 
-    def _conformity_neighbors(
-        self,
-        repertoire: MONETRepertoire,
-        neighbor_candidates: jax.Array,
-        key: RNGKey,
-    ) -> Tuple[jax.Array, jax.Array]:
-        """LEGACY conformity_mode="frequency": frequency-dependent
-        (conformist) transmission after Boyd & Richerson. Kept verbatim so
-        the existing conf_a{alpha}_m{m} results stay reproducible (bit for
-        bit: as the sole social operator, ask() also seeds empty focal cells
-        under init_strategy="copy" from the adopted variant, as the old code
-        did); it is NOT the paper's conformity any more (see
-        ``_conformity_candidate`` for the "majority" and "medoid" modes).
-
-        For each focal task, ``conformity_m`` neighbours are sampled UNIFORMLY
-        WITH REPLACEMENT from the task's neighbourhood (restricted to
-        neighbours that hold an elite), their elite genotypes are grouped into
-        variants by exact equality, and variant j is adopted verbatim with
-
-            P(j) = c_j ** alpha / sum_k c_k ** alpha,
-
-        where c_j is the number of the m samples carrying variant j.
-
-        Implementation: sample i is drawn with weight c(i) ** (alpha - 1),
-        where c(i) counts the samples equal to sample i. Since variant j
-        contributes c_j such samples, the induced variant law is exactly
-        c_j ** alpha / sum_k c_k ** alpha.
-
-        Reductions: alpha = 1 gives unbiased copying of one uniformly sampled
-        neighbour; m = 1 gives copying of one uniformly sampled neighbour for
-        any alpha; alpha = 0 gives a uniform draw over the distinct variants.
-
-        NOTE: this operator does NOT use ``neighbor_strategy``. Frequency-
-        dependent transmission is defined over a uniform sample of the
-        neighbourhood, so the m samples are always drawn uniformly over the
-        occupied neighbours; ``neighbor_strategy`` still governs the single
-        neighbour handed to the other social operators. Consequence for
-        experiments: the operator does not separate "conformity +
-        best_fitness" from "conformity + random", so that pair cannot serve
-        as a control that isolates the neighbour rule; use sbx/copy with
-        ``neighbor_strategy`` in {random, best_fitness} for that. The two
-        runs are nevertheless NOT bit-identical while the archive has empty
-        cells: with init_strategy="copy" (the default) an empty focal cell
-        is filled from the strategy-picked neighbour's elite. They coincide
-        with init_strategy="random" or a pre-filled archive.
-
-        Memory: the variant counting compares m x m genotype pairs per focal
-        task, i.e. O(batch_size * m^2 * genotype_size) during the ask step.
-
-        Args:
-            repertoire: the MONET repertoire
-            neighbor_candidates: neighbors of each focal task, of shape
-                (batch_size, num_neighbors)
-            key: a jax PRNG random key
-
-        Returns:
-            the indices of the adopted neighbor tasks, of shape (batch_size,),
-            and a boolean mask, of shape (batch_size,), that is True where the
-            focal task had at least one neighbor holding an elite.
-        """
-        batch_size, num_neighbors = neighbor_candidates.shape
-        m = self._conformity_m
-        occupied = repertoire.fitnesses[neighbor_candidates, 0] > -jnp.inf
-        any_occupied = jnp.any(occupied, axis=1)
-
-        # uniform over the occupied neighbours; if a focal task has none, fall
-        # back to a uniform draw over all of them (the caller then replaces the
-        # offspring exactly as it does for an unoccupied single neighbour)
-        logits = jnp.where(occupied, 0.0, -jnp.inf)
-        logits = jnp.where(any_occupied[:, None], logits, jnp.zeros_like(logits))
-        key, subkey = jax.random.split(key)
-        columns = jax.random.categorical(subkey, logits, axis=-1, shape=(m, batch_size))
-        columns = jnp.transpose(columns)                       # (batch_size, m)
-        sampled = jnp.take_along_axis(neighbor_candidates, columns, axis=1)
-
-        # count, for every sample, how many of the m samples carry the same
-        # genotype (exact equality over every leaf of the pytree)
-        equal = jnp.ones((batch_size, m, m), dtype=bool)
-        for leaf in jax.tree.leaves(repertoire.genotypes):
-            values = leaf[sampled]                             # (batch_size, m, ...)
-            values = values.reshape(batch_size, m, -1)
-            equal = equal & jnp.all(
-                values[:, :, None, :] == values[:, None, :, :], axis=-1
-            )
-        counts = jnp.sum(equal, axis=2).astype(jnp.float32)     # (batch_size, m)
-
-        key, subkey = jax.random.split(key)
-        log_weights = (self._conformity_alpha - 1.0) * jnp.log(counts)
-        picked = jax.random.categorical(subkey, log_weights, axis=-1)
-        adopted = sampled[jnp.arange(batch_size), picked]
-        return adopted, any_occupied
-
     def _majority_variant(
         self,
         repertoire: MONETRepertoire,
@@ -808,9 +652,6 @@ class MONET:
         counts = jnp.sum(equal & occupied[:, None, :], axis=2)
         counts = jnp.where(occupied, counts, 0)
         is_max = occupied & (counts == jnp.max(counts, axis=1, keepdims=True))
-        # uniform over the neighbours carrying a maximal-count variant ==
-        # uniform over the tied variants; an empty neighbourhood gets a
-        # uniform draw over all columns (replaced by the caller anyway)
         logits = jnp.where(is_max, 0.0, -jnp.inf)
         logits = jnp.where(any_occupied[:, None], logits, jnp.zeros_like(logits))
         columns = jax.random.categorical(key, logits, axis=-1)
@@ -842,15 +683,13 @@ class MONET:
             neighbours whose count equals the maximum is uniform over the
             tied variants. An all-distinct neighbourhood therefore copies a
             uniformly random neighbour.
-        "medoid" (medoid pressure): with d_i the Euclidean distance between
-            the focal task descriptor and neighbour i's task descriptor (the
-            repertoire centroids), w_i = (1 / (d_i + 1e-8)) / sum_j 1 / (d_j
-            + 1e-8) over N, target = sum_i w_i * genotype_i and the candidate
-            is clip(x + lambda * (target - x), minval, maxval), lambda in
-            (0, 1]; lambda = 1 sets the candidate to the target exactly.
-        "frequency" (LEGACY): the previous operator, ``_conformity_neighbors``
-            — m neighbours drawn uniformly with replacement from N, variant j
-            adopted verbatim with probability c_j**alpha / sum_k c_k**alpha.
+        "medoid" (medoid pressure): with d_j the Euclidean distance between
+            the focal task descriptor and neighbour j's task descriptor (the
+            repertoire centroids), w_j = (1 / (d_j + 1e-8)) / sum_k 1 / (d_k
+            + 1e-8) over N, i* = argmin_{i in N} sum_{j in N} w_j * ||g_i - g_j||_2,
+            target = genotype_{i*} and the candidate is
+            clip(x + lambda * (target - x), minval, maxval), lambda in
+            (0, 1]; lambda = 1 sets the candidate to the medoid exactly.
 
         In every mode the candidate is evaluated on the focal task and
         accepted with the repertoire's >= rule; nothing is enforced. If N is
@@ -866,9 +705,9 @@ class MONET:
         "conformity + best_fitness" and "conformity + random" only coincide
         with init_strategy="random" or a pre-filled archive.
 
-        Memory ("majority"): the variant counting compares K x K genotype
-        pairs per focal task, i.e. O(batch_size * K^2 * genotype_size); when
-        that exceeds _majority_direct_max (2^20) elements the comparison is scanned one genotype
+        Memory: the pairwise K x K genotype comparison per focal task is
+        O(batch_size * K^2 * genotype_size); when that exceeds
+        _majority_direct_max (2^20) elements the comparison is scanned one genotype
         component at a time, which bounds it at O(batch_size * K^2).
 
         Args:
@@ -882,27 +721,16 @@ class MONET:
 
         Returns:
             the candidate genotype (pytree like ``x``), the neighbourhood
-            representative it was built from (the majority variant, the
-            UNCLIPPED weighted mean target, or the legacy adopted variant;
-            exposed for tests / diagnostics only -- ask() never uses it, in
-            particular an empty focal cell under init_strategy="copy" is
-            initialised from the strategy-selected neighbour's elite as in
-            the reference; the one exception is the legacy "frequency" mode
-            as the sole social operator, whose init source is the adopted
-            variant as in the old code) and a boolean mask, of shape
-            (batch_size,), that
-            is True where the focal task had at least one neighbour holding
-            an elite.
+            representative it was built from (the majority variant or the
+            medoid target; exposed for tests / diagnostics
+            only -- ask() never uses it, in particular an empty focal cell
+            under init_strategy="copy" is initialised from the
+            strategy-selected neighbour's elite as in the reference) and a
+            boolean mask, of shape (batch_size,), that is True where the
+            focal task had at least one neighbour holding an elite.
         """
         batch_size, num_neighbors = neighbor_candidates.shape
         mode = self._conformity_mode
-
-        if mode == "frequency":
-            adopted, any_occupied = self._conformity_neighbors(
-                repertoire, neighbor_candidates, key
-            )
-            y = jax.tree.map(lambda g: g[adopted], repertoire.genotypes)
-            return y, y, any_occupied
 
         occupied = repertoire.fitnesses[neighbor_candidates, 0] > -jnp.inf
         any_occupied = jnp.any(occupied, axis=1)
@@ -915,7 +743,7 @@ class MONET:
             y, _ = self._majority_variant(repertoire, neighbor_candidates, key)
             return y, y, any_occupied
 
-        # mode == "medoid": proximity-weighted mean of the occupied neighbours
+        # mode == "medoid": proximity-weighted medoid of the occupied neighbours
         focal_descriptors = repertoire.centroids[task_indices]              # (B, D)
         neighbor_descriptors = repertoire.centroids[neighbor_candidates]    # (B, K, D)
         distances = jnp.sqrt(
@@ -928,11 +756,36 @@ class MONET:
         total = jnp.sum(weights, axis=1, keepdims=True)
         weights = weights / jnp.where(total > 0.0, total, 1.0)              # (B, K)
 
-        def _weighted_mean(leaf: jax.Array) -> jax.Array:
-            w = weights.reshape(weights.shape + (1,) * (leaf.ndim - 2))
-            return jnp.sum(w * leaf, axis=1)
+        values = jnp.concatenate(
+            [
+                leaf.reshape(batch_size, num_neighbors, -1)
+                for leaf in jax.tree.leaves(neighbor_genotypes)
+            ],
+            axis=-1,
+        )
+        num_features = values.shape[-1]
+        if batch_size * num_neighbors * num_neighbors * num_features <= self._majority_direct_max:
+            sq_dists = jnp.sum(
+                jnp.square(values[:, :, None, :] - values[:, None, :, :]),
+                axis=-1,
+            )
+        else:
 
-        target = jax.tree.map(_weighted_mean, neighbor_genotypes)
+            def _scan_sq_dist(carry: jax.Array, v: jax.Array) -> Tuple[jax.Array, None]:
+                return carry + jnp.square(v[:, :, None] - v[:, None, :]), None
+
+            sq_dists, _ = jax.lax.scan(
+                _scan_sq_dist,
+                jnp.zeros((batch_size, num_neighbors, num_neighbors), dtype=values.dtype),
+                jnp.moveaxis(values, -1, 0),
+            )
+        genotype_dists = jnp.sqrt(sq_dists)                                 # (B, K, K)
+        costs = jnp.sum(genotype_dists * weights[:, None, :], axis=2)       # (B, K)
+        costs = jnp.where(occupied, costs, jnp.inf)
+        medoid_cols = jnp.argmin(costs, axis=1)
+        target = jax.tree.map(
+            lambda g: g[jnp.arange(batch_size), medoid_cols], neighbor_genotypes
+        )
         lam = self._conformity_lambda
         if lam >= 1.0:
             candidate = jax.tree.map(
@@ -1030,18 +883,8 @@ class MONET:
                     )
                 )
             elif operator == "conformity":
-                # The offspring IS the conformity candidate: the local
-                # majority variant ("majority"), the focal elite pulled
-                # towards the proximity-weighted neighbourhood mean
-                # ("medoid") or the legacy frequency-biased variant
-                # ("frequency"). Built in ask() by _conformity_candidate.
                 offsprings.append(jax.tree.map(lambda leaf: leaf, y_conformity))
             elif operator == "copy":
-                # Verbatim conformity: adopt the neighbour's elite unchanged.
-                # The hard end of the specialist<->generalist dial — the
-                # offspring IS the neighbour's controller, so accepted copies
-                # make one controller cover several tasks (duplicates are
-                # exact, which is what makes #distinct-controllers meaningful).
                 offsprings.append(jax.tree.map(lambda leaf: leaf, y))
             else:  # iso_dd
                 offsprings.append(
@@ -1128,14 +971,6 @@ class MONET:
         y = jax.tree.map(lambda g: g[neighbor_indices], repertoire.genotypes)
         neighbor_occupied = repertoire.fitnesses[neighbor_indices, 0] > -jnp.inf
 
-        # conformity reads the whole neighbourhood (not the single neighbour
-        # selected above) and builds its own candidate, so it carries its
-        # own occupancy mask (True iff some neighbour holds an elite). That
-        # mask gates the Gaussian fallback ONLY on the rows whose applied
-        # operator is conformity (see _social_learning); y and
-        # neighbor_occupied -- the strategy-selected neighbour -- are left
-        # untouched so the init_strategy="copy" path below copies that
-        # neighbour's elite exactly as the reference does.
         if "conformity" in self._social_learning_ops:
             key, subkey = jax.random.split(key)
             y_conformity, _, conformity_occupied = self._conformity_candidate(
@@ -1153,9 +988,6 @@ class MONET:
         key, subkey = jax.random.split(key)
         individual_offspring = self._individual_learning(x, subkey, batch_size)
 
-        # social learning: crossover with the neighbor elite, with a
-        # fallback to a Gaussian mutation when the neighbor has no elite
-        # (conformity rows: when the whole neighbourhood has no elite)
         key, subkey = jax.random.split(key)
         social_offspring, is_conformity = self._social_learning(
             x, y, subkey, batch_size, y_conformity=y_conformity
@@ -1172,26 +1004,11 @@ class MONET:
 
         genotypes = _tree_where(individual, individual_offspring, social_offspring)
 
-        # focal tasks without elite: copy the neighbor elite (when social
-        # learning is applied and the neighbor has one) or sample a random
-        # solution. LEGACY: the pre-2026-09-23 code seeded empty focal cells
-        # from the frequency-adopted variant when "conformity" was the sole
-        # social operator; that case keeps its old init source so the
-        # conf_a{alpha}_m{m} archives stay bit-reproducible. Every other
-        # configuration (spec modes, mixed tuples, sbx / copy / iso_dd)
-        # copies the strategy-selected neighbour, as the reference does.
-        if (
-            self._conformity_mode == "frequency"
-            and self._social_learning_ops == ("conformity",)
-        ):
-            y_init, init_occupied = y_conformity, conformity_occupied
-        else:
-            y_init, init_occupied = y, neighbor_occupied
         key, subkey = jax.random.split(key)
         random_genotypes = _tree_uniform(x, subkey, self._minval, self._maxval)
         if self._init_strategy == "copy":
             init_genotypes = _tree_where(
-                (~individual) & init_occupied, y_init, random_genotypes
+                (~individual) & neighbor_occupied, y, random_genotypes
             )
         else:
             init_genotypes = random_genotypes
@@ -1201,10 +1018,6 @@ class MONET:
         if self._conformity_pressure <= 0.0:
             return genotypes, task_indices, op_info
 
-        # conformity pressure: with probability conformity_pressure a social
-        # row copies its neighbourhood's majority genotype instead, and that
-        # copy is enforced in tell(). Drawn after everything above, so the
-        # other rows' offspring are the ones pressure = 0 would produce.
         key, subkey = jax.random.split(key)
         y_majority, majority_occupied = self._majority_variant(
             repertoire, monet_state.neighbor_indices[task_indices], subkey
@@ -1308,8 +1121,6 @@ class MONET:
             fitnesses = jnp.where(
                 cell_enforced[task_indices] & ~enforced, -jnp.inf, fitnesses
             )
-            # clear the incumbents of the enforced cells, so the >= rule of
-            # the repertoire admits the enforced copy whatever its score
             repertoire = repertoire.replace(
                 fitnesses=jnp.where(
                     cell_enforced[:, None], -jnp.inf, repertoire.fitnesses
@@ -1317,8 +1128,6 @@ class MONET:
             )
         task_descriptors = repertoire.centroids[task_indices]
 
-        # add genotypes to the repertoire: as the descriptor of an offspring
-        # is exactly the descriptor of its task, it lands in the task's cell
         repertoire = repertoire.add(
             genotypes, task_descriptors, fitnesses, extra_scores
         )
