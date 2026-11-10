@@ -393,6 +393,7 @@ class MONET:
         conformity_mode: str = "majority",
         conformity_lambda: float = 0.5,
         conformity_pressure: float = 0.0,
+        pressure_temperature: Optional[float] = None,
         minval: float = 0.0,
         maxval: float = 1.0,
         repertoire_init: Callable[
@@ -447,6 +448,10 @@ class MONET:
                 "conformity_pressure > 0 replaces the 'conformity' social operator; "
                 "use one or the other."
             )
+        if pressure_temperature is not None and not (float(pressure_temperature) > 0.0):
+            raise ValueError(
+                f"pressure_temperature must be > 0 (or None = enforced), got {pressure_temperature}."
+            )
 
         self._scoring_function = scoring_function
         self._metrics_function = metrics_function
@@ -473,6 +478,11 @@ class MONET:
         self._conformity_mode = str(conformity_mode)
         self._conformity_lambda = float(conformity_lambda)
         self._conformity_pressure = float(conformity_pressure)
+        # tempered pressure (2026-11-10): None = the enforced rule above (bit-identical to before);
+        # a float tau = Metropolis acceptance of the majority copy, see tell().
+        self._pressure_temperature = (
+            None if pressure_temperature is None else float(pressure_temperature)
+        )
         self._minval = minval
         self._maxval = maxval
         self._repertoire_init = repertoire_init
@@ -1072,6 +1082,7 @@ class MONET:
         monet_state: MONETState,
         key: RNGKey,
         conformity_pressure: Optional[jax.Array] = None,
+        pressure_temperature: Optional[jax.Array] = None,
     ) -> Tuple[Genotype, jax.Array, ExtraScores]:
         """
         Generate a new batch of genotypes: sample the focal tasks, apply
@@ -1085,6 +1096,12 @@ class MONET:
             key: a jax PRNG random key
             conformity_pressure: optional per-call override of the
                 constructor's conformity_pressure (see there; schedules).
+            pressure_temperature: optional per-call override of the
+                constructor's pressure_temperature (annealed temperatures).
+                When a temperature is active (either source) one uniform per
+                row is drawn here and returned as "conformity_u" for tell()'s
+                Metropolis test; no draw happens otherwise, so runs without a
+                temperature consume the random stream exactly as before.
 
         Returns:
             a new batch of genotypes, the indices of the tasks on which they
@@ -1203,7 +1220,16 @@ class MONET:
             )
         )
         genotypes = _tree_where(enforced, y_majority, genotypes)
-        return genotypes, task_indices, dict(op_info, conformity_enforced=enforced)
+        op_info = dict(op_info, conformity_enforced=enforced)
+        tau = (
+            self._pressure_temperature
+            if pressure_temperature is None
+            else pressure_temperature
+        )
+        if tau is not None:
+            key, subkey = jax.random.split(key)
+            op_info["conformity_u"] = jax.random.uniform(subkey, (batch_size,))
+        return genotypes, task_indices, op_info
 
     def tell(
         self,
@@ -1215,6 +1241,7 @@ class MONET:
         extra_scores: Optional[ExtraScores] = None,
         enforced: Optional[jax.Array] = None,
         op_info: Optional[dict] = None,
+        pressure_temperature: Optional[jax.Array] = None,
     ) -> Tuple[MONETRepertoire, MONETState, Metrics]:
         """
         Add new genotypes to the repertoire.
@@ -1232,13 +1259,41 @@ class MONET:
                 replaces its cell's elite whatever its fitness; the other rows
                 aimed at that cell are dropped; several enforced rows on one
                 cell keep the fittest. None (default) enforces nothing.
+            pressure_temperature: optional per-call override of the
+                constructor's pressure_temperature. With a temperature tau the
+                enforcement of a row is TEMPERED (Metropolis): a majority copy
+                scoring f against an incumbent old is enforced with probability
+                min(1, exp(delta / tau)), delta = (f - old) / max(|old|, 1e-8)
+                (relative, as k(delta)); gains and copies into empty cells are
+                always enforced, a loss is enforced with probability
+                exp(-|delta| / tau). A row that loses the draw is an ordinary
+                row again, subject to the >= rule. Needs "conformity_u" in
+                op_info (drawn by ask()). None (both sources) = enforced.
         """
         if extra_scores is None:
             extra_scores = {}
 
         fitnesses = jnp.ravel(fitnesses)
+        tau = (
+            self._pressure_temperature
+            if pressure_temperature is None
+            else pressure_temperature
+        )
+        if enforced is not None and tau is not None:
+            if op_info is None or "conformity_u" not in op_info:
+                raise ValueError(
+                    "tell(): a pressure_temperature needs op_info['conformity_u'] from ask()."
+                )
+            enforced = jnp.ravel(enforced)
+            old = repertoire.fitnesses[task_indices, 0]
+            occupied = old > -jnp.inf
+            delta = (fitnesses - old) / jnp.maximum(jnp.abs(old), 1e-8)
+            p_accept = jnp.where(
+                occupied, jnp.exp(jnp.minimum(0.0, delta / tau)), 1.0
+            )
+            enforced = enforced & (jnp.ravel(op_info["conformity_u"]) < p_accept)
         stats_update = None
-        if op_info is not None and monet_state.op_stats is not None:
+        if op_info is not None and monet_state is not None and monet_state.op_stats is not None:
             stats_update = self._op_stats_update(
                 fitnesses, task_indices, repertoire, op_info, enforced)
         if enforced is not None:
@@ -1309,6 +1364,7 @@ class MONET:
         monet_state: MONETState,
         key: RNGKey,
         conformity_pressure: Optional[jax.Array] = None,
+        pressure_temperature: Optional[jax.Array] = None,
     ) -> Tuple[MONETRepertoire, MONETState, Metrics]:
         """
         Performs one iteration of the MONET algorithm.
@@ -1326,6 +1382,8 @@ class MONET:
             monet_state: the MONET state, holding the task similarity graph
             key: a jax PRNG random key
             conformity_pressure: optional per-call pressure, passed to ask().
+            pressure_temperature: optional per-call temperature, passed to
+                ask() and tell() (tempered enforcement; None = enforced).
 
         Returns:
             the updated MONET repertoire, the MONET state and metrics about
@@ -1337,7 +1395,8 @@ class MONET:
         # generate offsprings on their focal tasks
         key, subkey = jax.random.split(key)
         genotypes, task_indices, ask_info = self.ask(
-            repertoire, monet_state, subkey, conformity_pressure=conformity_pressure
+            repertoire, monet_state, subkey, conformity_pressure=conformity_pressure,
+            pressure_temperature=pressure_temperature,
         )
 
         # score the offsprings on the focal tasks
@@ -1355,7 +1414,8 @@ class MONET:
             extra_scores=extra_scores,
             enforced=ask_info.get("conformity_enforced"),
             op_info=ask_info,
-        )
+                    pressure_temperature=pressure_temperature,
+)
 
     def scan_update(
         self,
